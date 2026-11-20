@@ -1,6 +1,6 @@
 import React, { useEffect, useRef, useState, useCallback } from 'react';
 import ePub from 'epubjs';
-import { BookOpen, Plus, ArrowLeft, ChevronLeft, ChevronRight, SlidersHorizontal, List, Bookmark, BookmarkCheck, Trash2, Upload, Library, Search, X, Check, Sun, Moon, AlignLeft, Columns2, Maximize2, HardDriveDownload, RotateCcw, Menu, Info } from 'lucide-react';
+import { BookOpen, Plus, ArrowLeft, ChevronLeft, ChevronRight, SlidersHorizontal, List, Bookmark, BookmarkCheck, Trash2, Upload, Library, Search, X, Check, Sun, Moon, AlignLeft, Columns2, Maximize2, HardDriveDownload, RotateCcw, Menu, Info, Play, Pause, Square, Volume2 } from 'lucide-react';
 import { getBooks, getBook, putBook, patchBook, removeBook } from './db.js';
 
 const DEFAULT_SETTINGS = { theme: 'paper', fontSize: 19, font: 'literary', lineHeight: 1.7, flow: 'paginated', margin: 48 };
@@ -11,6 +11,30 @@ const FONTS = [
   { id: 'clean', label: 'Legible', value: 'Verdana, Geneva, sans-serif' },
   { id: 'mono', label: 'Monoespaciada', value: '"Courier New", monospace' }
 ];
+const DEFAULT_VOICE_SETTINGS = { voiceURI: '', rate: 1 };
+function getVoiceSettings() { try { return { ...DEFAULT_VOICE_SETTINGS, ...JSON.parse(localStorage.getItem('hoja-voice') || '{}') }; } catch { return DEFAULT_VOICE_SETTINGS; } }
+function speechChunks(text) {
+  const phrases = (text || '').replace(/\s+/g, ' ').trim().match(/[^.!?;:]+[.!?;:]?|[^.!?;:]+$/g) || [];
+  const out = []; let buffer = '';
+  for (const phrase of phrases) {
+    const part = phrase.trim(); if (!part) continue;
+    if (buffer && (buffer.length + part.length > 170)) { out.push(buffer); buffer = ''; }
+    if (part.length > 170) {
+      if (buffer) { out.push(buffer); buffer = ''; }
+      const words = part.split(/\s+/); let chunk = '';
+      for (const word of words) { if (chunk && chunk.length + word.length > 150) { out.push(chunk); chunk = ''; } chunk += (chunk ? ' ' : '') + word; }
+      buffer = chunk;
+    } else buffer += (buffer ? ' ' : '') + part;
+  }
+  if (buffer) out.push(buffer);
+  return out;
+}
+function extractSpeechBlocks(contents) {
+  const doc = contents?.document; if (!doc?.body) return [];
+  let elements = [...doc.body.querySelectorAll('h1,h2,h3,h4,h5,h6,p,li,blockquote,pre')].filter(el => !el.closest('nav,script,style,svg,button') && !el.querySelector('p,li,blockquote,pre'));
+  if (!elements.length) elements = [doc.body];
+  return elements.map(element => ({ element, text: element.textContent?.replace(/\s+/g, ' ').trim() || '' })).filter(b => b.text.length > 1);
+}
 const COLORS = ['#3b5144', '#7a5b76', '#375675', '#986d46', '#436965', '#704e4b'];
 function readSettings() { try { return { ...DEFAULT_SETTINGS, ...JSON.parse(localStorage.getItem('hoja-settings') || '{}') }; } catch { return DEFAULT_SETTINGS; } }
 function cleanText(v, fallback = '') { return typeof v === 'string' ? v.trim() || fallback : fallback; }
@@ -98,8 +122,118 @@ function Reader({ id, onBack, settings, onSettings, setNotice }) {
   const [pageMotion, setPageMotion] = useState('');
   const [readerReady, setReaderReady] = useState(false);
   const positionOnOpen = useRef(null);
+  const [voiceSettings, setVoiceSettings] = useState(getVoiceSettings);
+  const [voices, setVoices] = useState([]);
+  const [speechState, setSpeechState] = useState('idle');
+  const [speechLabel, setSpeechLabel] = useState('');
+  const speechRef = useRef({ token: 0, block: 0, chunk: 0, blocks: [], parts: [], sectionHref: null });
+  const isSpeechSupported = typeof window !== 'undefined' && 'speechSynthesis' in window && 'SpeechSynthesisUtterance' in window;
   const settingsRef = useRef(settings);
   settingsRef.current = settings;
+  useEffect(() => { try { localStorage.setItem('hoja-voice', JSON.stringify(voiceSettings)); } catch {} }, [voiceSettings]);
+  useEffect(() => {
+    if (!isSpeechSupported) return;
+    const load = () => setVoices(window.speechSynthesis.getVoices());
+    load();
+    window.speechSynthesis.addEventListener?.('voiceschanged', load);
+    return () => window.speechSynthesis.removeEventListener?.('voiceschanged', load);
+  }, [isSpeechSupported]);
+
+  function stopSpeech() {
+    speechRef.current.token += 1;
+    try { window.speechSynthesis?.cancel(); } catch {}
+    setSpeechState('idle');
+    setSpeechLabel('');
+  }
+
+  function selectVoice() {
+    return voices.find(v => v.voiceURI === voiceSettings.voiceURI)
+      || voices.find(v => /^es[-_]/i.test(v.lang) && /natural|premium|enhanced|mejorada/i.test(v.name))
+      || voices.find(v => /^es[-_]/i.test(v.lang)) || voices[0];
+  }
+
+  // The Web Speech API requires a user gesture to begin on iOS.
+  // Short utterances help Safari avoid prematurely ending long speeches.
+  function speakNext(token) {
+    const data = speechRef.current;
+    if (!mounted.current || token !== data.token) return;
+    if (data.chunk >= data.parts.length) {
+      data.block += 1;
+      data.chunk = 0;
+      if (data.block >= data.blocks.length) { void advanceSpeechSection(token); return; }
+      data.parts = speechChunks(data.blocks[data.block].text);
+    }
+    const phrase = data.parts[data.chunk++];
+    if (!phrase) { speakNext(token); return; }
+    const utterance = new SpeechSynthesisUtterance(phrase);
+    utterance.lang = selectVoice()?.lang || 'es-ES';
+    utterance.voice = selectVoice() || null;
+    utterance.rate = voiceSettings.rate;
+    utterance.pitch = 1;
+    utterance.onend = () => { if (token === speechRef.current.token) speakNext(token); };
+    utterance.onerror = (e) => {
+      if (token !== speechRef.current.token || e.error === 'interrupted' || e.error === 'canceled') return;
+      stopSpeech(); setNotice(`La voz se interrumpió (${e.error}). Pulsa Play para continuar.`);
+    };
+    try { window.speechSynthesis.speak(utterance); }
+    catch (err) { stopSpeech(); setNotice(getErrorMessage(err)); }
+  }
+
+  async function beginSpeechSection(token, fromCurrentPosition = false) {
+    if (!mounted.current || token !== speechRef.current.token) return;
+    const contents = renditionRef.current?.getContents?.()?.[0];
+    const blocks = extractSpeechBlocks(contents);
+    if (!blocks.length) { await advanceSpeechSection(token); return; }
+    let start = 0;
+    if (fromCurrentPosition && currentCfi.current && contents?.range) {
+      try {
+        const range = contents.range(currentCfi.current);
+        const node = range?.startContainer;
+        const index = blocks.findIndex(b => b.element === node || b.element.contains(node));
+        if (index >= 0) start = index;
+      } catch { /* Fallback to the beginning of the currently opened section. */ }
+    }
+    const data = speechRef.current;
+    data.blocks = blocks; data.block = start; data.chunk = 0;
+    data.parts = speechChunks(blocks[start].text);
+    data.sectionHref = renditionRef.current?.currentLocation?.()?.start?.href || null;
+    setSpeechLabel(currentTitle || 'Narrando capítulo');
+    speakNext(token);
+  }
+
+  async function advanceSpeechSection(token) {
+    const data = speechRef.current;
+    if (!mounted.current || token !== data.token) return;
+    const book = bookRef.current;
+    const section = book?.spine?.get(data.sectionHref);
+    const next = section?.next?.();
+    if (!next) { stopSpeech(); setNotice('Terminaste de escuchar el libro.'); return; }
+    try {
+      await renditionRef.current.display(next.href);
+      if (token === speechRef.current.token) await beginSpeechSection(token, false);
+    } catch (e) { stopSpeech(); setNotice(`No se pudo avanzar al próximo capítulo: ${getErrorMessage(e)}`); }
+  }
+
+  function playSpeech() {
+    if (!isSpeechSupported) { setNotice('Este navegador no admite lectura en voz alta.'); return; }
+    if (!renditionRef.current || loading) { setNotice('Espera a que el libro termine de abrirse.'); return; }
+    if (speechState === 'paused') {
+      try { window.speechSynthesis.resume(); setSpeechState('playing'); } catch (e) { setNotice(getErrorMessage(e)); }
+      return;
+    }
+    stopSpeech();
+    const token = speechRef.current.token;
+    setSpeechState('playing');
+    void beginSpeechSection(token, true);
+  }
+
+  function pauseSpeech() {
+    try { window.speechSynthesis.pause(); setSpeechState('paused'); }
+    catch (e) { setNotice(getErrorMessage(e)); }
+  }
+
+  useEffect(() => () => { speechRef.current.token++; try { window.speechSynthesis?.cancel(); } catch {} }, []);
+  useEffect(() => { if (speechState !== 'idle') stopSpeech(); }, [settings.flow]);
 
   useEffect(() => {
     mounted.current = true;
@@ -186,11 +320,12 @@ function Reader({ id, onBack, settings, onSettings, setNotice }) {
   async function move(direction) {
     if (!renditionRef.current || navLock.current || settings.flow !== 'paginated') return;
     navLock.current = true;
+    if (speechState !== 'idle') stopSpeech();
     triggerMotion(direction);
     try { if (direction === 'next') await renditionRef.current.next(); else await renditionRef.current.prev(); } catch (e) { setNotice(getErrorMessage(e)); }
     finally { navLock.current = false; }
   }
-  async function jump(target) { try { setPanel(null); await renditionRef.current?.display(target); } catch (e) { setNotice(getErrorMessage(e)); } }
+  async function jump(target) { if (speechState !== 'idle') stopSpeech(); try { setPanel(null); await renditionRef.current?.display(target); } catch (e) { setNotice(getErrorMessage(e)); } }
   async function toggleBookmark() {
     const cfi = currentCfi.current;
     if (!cfi) { setNotice('Abre una página para colocar el marcador.'); return; }
@@ -219,7 +354,7 @@ function Reader({ id, onBack, settings, onSettings, setNotice }) {
   const activeBookmark = markers.some(m => m.cfi === currentCfi.current);
   const isDark = settings.theme === 'night';
   return <div className={`app reader-screen theme-${settings.theme}`}>
-    <header className="reader-top"><div className="reader-top-left"><button className="icon-button" onClick={onBack} title="Biblioteca" aria-label="Volver a biblioteca"><ArrowLeft size={20}/></button><div className="reader-brand">hoja<span>.</span></div><span className="top-separator"/><div className="reader-title"><strong>{record?.title || 'Abriendo libro...'}</strong><span>{record?.author || ''}</span></div></div><div className="reader-top-right"><button className="icon-button" onClick={() => setPanel(panel === 'toc' ? null : 'toc')} title="Índice" aria-label="Índice"><List size={21}/></button><button className="icon-button" onClick={toggleBookmark} title="Marcar página" aria-label="Marcar página">{activeBookmark ? <BookmarkCheck size={20}/> : <Bookmark size={20}/>}</button><button className={`icon-button ${panel === 'settings' ? 'selected' : ''}`} onClick={() => setPanel(panel === 'settings' ? null : 'settings')} title="Ajustes" aria-label="Ajustes"><SlidersHorizontal size={20}/></button></div></header>
+    <header className="reader-top"><div className="reader-top-left"><button className="icon-button" onClick={() => { stopSpeech(); onBack(); }} title="Biblioteca" aria-label="Volver a biblioteca"><ArrowLeft size={20}/></button><div className="reader-brand">hoja<span>.</span></div><span className="top-separator"/><div className="reader-title"><strong>{record?.title || 'Abriendo libro...'}</strong><span>{record?.author || ''}</span></div></div><div className="reader-top-right"><button className={`icon-button ${speechState !== 'idle' ? 'selected' : ''}`} onClick={() => setPanel(panel === 'audio' ? null : 'audio')} aria-label="Escuchar libro" title="Escuchar libro"><Volume2 size={21}/></button><button className="icon-button" onClick={() => setPanel(panel === 'toc' ? null : 'toc')} title="Índice" aria-label="Índice"><List size={21}/></button><button className="icon-button" onClick={toggleBookmark} title="Marcar página" aria-label="Marcar página">{activeBookmark ? <BookmarkCheck size={20}/> : <Bookmark size={20}/>}</button><button className={`icon-button ${panel === 'settings' ? 'selected' : ''}`} onClick={() => setPanel(panel === 'settings' ? null : 'settings')} title="Ajustes" aria-label="Ajustes"><SlidersHorizontal size={20}/></button></div></header>
     <main className="reader-content" onTouchStart={onTouchStart} onTouchEnd={onTouchEnd}>
       {settings.flow === 'paginated' && <button className="nav-area nav-area-left" onClick={() => move('prev')} aria-label="Página anterior"><ChevronLeft size={24}/></button>}
       <div className={`reader-page ${pageMotion ? `motion-${pageMotion}` : ''}`}>
@@ -231,9 +366,15 @@ function Reader({ id, onBack, settings, onSettings, setNotice }) {
       </div>
       {settings.flow === 'paginated' && <button className="nav-area nav-area-right" onClick={() => move('next')} aria-label="Página siguiente"><ChevronRight size={24}/></button>}
     </main>
+    {isSpeechSupported && <div className="speech-bar" role="region" aria-label="Reproductor de voz"><button className="speech-play" onClick={speechState === 'playing' ? pauseSpeech : playSpeech} disabled={loading} title={speechState === 'playing' ? 'Pausar' : 'Reproducir'}>{speechState === 'playing' ? <Pause size={19} fill="currentColor"/> : <Play size={19} fill="currentColor"/>}</button><div className="speech-description"><strong>{speechState === 'playing' ? 'Leyendo en voz alta' : speechState === 'paused' ? 'Lectura pausada' : 'Escuchar este libro'}</strong><small>{speechState === 'idle' ? 'Pulsa Play para comenzar' : speechLabel}</small></div><button className="speech-control" title="Detener voz" aria-label="Detener voz" disabled={speechState === 'idle'} onClick={stopSpeech}><Square size={17}/></button><button className="speech-control" title="Opciones de voz" aria-label="Opciones de voz" onClick={() => setPanel('audio')}><SlidersHorizontal size={18}/></button></div>}
     <div className="reader-bottom"><div className="reader-bottom-inner"><span className="reading-small">{settings.flow === 'paginated' ? '← → para pasar páginas' : 'Desliza para continuar'}</span><div className="reader-progress"><div style={{ width: `${progress}%` }}/></div><span className="reading-percent">{Math.round(progress)}% leído</span></div></div>
-    {panel && <><div className="panel-scrim" onClick={() => setPanel(null)}/><aside className="side-panel"><div className="panel-heading"><div><small>HOJA · LECTOR</small><h2>{panel === 'settings' ? 'Tu lectura, a tu manera' : 'Explorar libro'}</h2></div><button className="icon-button" onClick={() => setPanel(null)} aria-label="Cerrar panel"><X size={19}/></button></div>
-      {panel === 'settings' ? <div className="settings-body"><div className="setting-group"><label>APARIENCIA</label><div className="theme-options">{[{ id: 'paper', label: 'Papel', color: '#fcfaf5' }, { id: 'sepia', label: 'Sepia', color: '#efe3cc' }, { id: 'night', label: 'Noche', color: '#25302c' }].map(t => <button key={t.id} className={`theme-choice ${settings.theme === t.id ? 'active' : ''}`} onClick={() => onSettings({ theme: t.id })}><span style={{ background: t.color }}>{settings.theme === t.id && <Check size={17} color={t.id === 'night' ? '#fff' : '#263d33'}/>}</span><span>{t.label}</span></button>)}</div></div>
+    {panel && <><div className="panel-scrim" onClick={() => setPanel(null)}/><aside className="side-panel"><div className="panel-heading"><div><small>HOJA · LECTOR</small><h2>{panel === 'settings' ? 'Tu lectura, a tu manera' : panel === 'audio' ? 'Escuchar libro' : 'Explorar libro'}</h2></div><button className="icon-button" onClick={() => setPanel(null)} aria-label="Cerrar panel"><X size={19}/></button></div>
+      {panel === 'audio' ? <div className="settings-body"><div className="audio-intro"><Volume2 size={27}/><p>Escucha el EPUB con las voces disponibles en tu dispositivo. La narración continúa al siguiente capítulo.</p></div>
+      <div className="setting-group"><label htmlFor="voice-list">VOZ DE NARRACIÓN</label><select id="voice-list" value={voiceSettings.voiceURI} onChange={e => { stopSpeech(); setVoiceSettings(s => ({ ...s, voiceURI: e.target.value })); }}><option value="">Automática (español si está disponible)</option>{voices.map((v, i) => <option key={`${v.voiceURI}-${i}`} value={v.voiceURI}>{v.name} — {v.lang}</option>)}</select></div>
+      <div className="setting-group"><label htmlFor="voice-rate">VELOCIDAD <b>{voiceSettings.rate.toFixed(2)}×</b></label><input id="voice-rate" type="range" min="0.65" max="1.75" step="0.05" value={voiceSettings.rate} onChange={e => { stopSpeech(); setVoiceSettings(s => ({ ...s, rate: Number(e.target.value) })); }}/></div>
+      <div className="audio-actions"><button className="button button-solid" disabled={loading || !isSpeechSupported} onClick={speechState === 'playing' ? pauseSpeech : playSpeech}>{speechState === 'playing' ? <Pause size={17}/> : <Play size={17}/>} {speechState === 'playing' ? 'Pausar' : speechState === 'paused' ? 'Continuar' : 'Reproducir'}</button><button className="button audio-stop" disabled={speechState === 'idle'} onClick={stopSpeech}><Square size={16}/> Detener</button></div>
+      <p className="audio-note">En iPhone, Safari puede detener el audio al bloquear la pantalla o salir de la app. Es una limitación de la síntesis de voz del navegador, no del archivo EPUB.</p>
+      </div> : panel === 'settings' ? <div className="settings-body"><div className="setting-group"><label>APARIENCIA</label><div className="theme-options">{[{ id: 'paper', label: 'Papel', color: '#fcfaf5' }, { id: 'sepia', label: 'Sepia', color: '#efe3cc' }, { id: 'night', label: 'Noche', color: '#25302c' }].map(t => <button key={t.id} className={`theme-choice ${settings.theme === t.id ? 'active' : ''}`} onClick={() => onSettings({ theme: t.id })}><span style={{ background: t.color }}>{settings.theme === t.id && <Check size={17} color={t.id === 'night' ? '#fff' : '#263d33'}/>}</span><span>{t.label}</span></button>)}</div></div>
       <div className="setting-group"><label htmlFor="font-family">TIPOGRAFÍA</label><select id="font-family" value={settings.font} onChange={e => onSettings({ font: e.target.value })}>{FONTS.map(f => <option key={f.id} value={f.id}>{f.label}</option>)}</select><div className="font-preview" style={{ fontFamily: FONTS.find(f => f.id === settings.font)?.value }}>La magia está entre las páginas.</div></div>
       <div className="setting-group"><label>TAMAÑO DE LETRA <b>{settings.fontSize}px</b></label><div className="slider-row"><span className="font-icon-small">A</span><input type="range" min="12" max="36" step="1" value={settings.fontSize} onChange={e => onSettings({ fontSize: Number(e.target.value) })}/><span className="font-icon-big">A</span></div></div>
       <div className="setting-group"><label>INTERLINEADO <b>{settings.lineHeight.toFixed(1)}</b></label><input type="range" min="1.2" max="2.2" step="0.1" value={settings.lineHeight} onChange={e => onSettings({ lineHeight: Number(e.target.value) })}/></div>
