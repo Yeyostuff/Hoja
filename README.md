@@ -2,7 +2,7 @@
 
 Aplicación web de lectura EPUB, hecha con **React + Vite + epub.js**, instalable como PWA en Android, iPhone y computadoras. Diseñada para publicar directamente en **Vercel**.
 
-## Funciones
+## Funciones ""
 
 - Importar varios archivos `.epub` sin enviarlos a ningún servidor.
 - Biblioteca local con títulos, autores, portadas tipográficas y porcentaje leído.
